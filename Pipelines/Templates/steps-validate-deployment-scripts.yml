@@ -62,7 +62,8 @@ steps:
       }
 
       foreach ($itemType in $expected.Keys) {
-          $items = Get-ProjectItems $itemType
+          # @() porque una función que regresa un solo elemento lo entrega como texto suelto.
+          $items = @(Get-ProjectItems $itemType)
           if ($items.Count -ne 1 -or $items[0] -ne $expected[$itemType]) {
               $errors.Add("El .sqlproj debe tener exactamente un <$itemType Include=""$($expected[$itemType])"" />. Encontrado: $($items -join ', ')")
           }
@@ -73,13 +74,13 @@ steps:
       }
 
       if ($isSdkProject) {
-          $removed = Get-ProjectItems 'Build' 'Remove'
+          $removed = @(Get-ProjectItems 'Build' 'Remove')
           if (-not ($removed | Where-Object { $_ -ieq ($prefix + '**') -or $_ -ieq ($prefix + '**\*.sql') })) {
               $errors.Add("Proyecto SDK: falta <Build Remove=""$prefix**"" /> para que los scripts no se compilen como esquema.")
           }
       }
 
-      $declaredVariables = Get-ProjectItems 'SqlCmdVariable'
+      $declaredVariables = @(Get-ProjectItems 'SqlCmdVariable')
       foreach ($variable in $requiredVariables) {
           if ($declaredVariables -notcontains $variable) {
               $errors.Add("El .sqlproj no declara la variable SQLCMD '$variable' (ver Deployment\README.md).")
