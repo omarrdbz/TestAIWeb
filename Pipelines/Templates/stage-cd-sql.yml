@@ -1,0 +1,68 @@
+parameters:
+  - name: environment
+    type: string
+
+  - name: pool
+    type: string
+
+  - name: artifactName
+    type: string
+    default: 'ScriptReport'
+
+  - name: sqlcmdPath
+    type: string
+    default: 'C:\Tools\sqlcmd\sqlcmd.exe'
+
+  - name: variableGroupCD
+    type: string
+
+  - name: dependsOn
+    type: string
+    default: 'DEPLOYMENT_PACKAGE'
+
+  - name: condition
+    type: string
+    default: 'succeeded()'
+
+  - name: allowDataLoss
+    type: boolean
+    default: false
+
+  - name: dataLossJustification
+    type: string
+    default: ' '
+
+  # Si se indica, los despliegues con allowDataLoss usan este environment
+  # (con sus propios aprobadores) en lugar del normal.
+  - name: dataLossEnvironment
+    type: string
+    default: ''
+
+stages:
+  - stage: CD_${{ parameters.environment }}
+    displayName: 'CD - Deploy to ${{ parameters.environment }}'
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    variables:
+      - group: ${{ parameters.variableGroupCD }}
+    pool:
+      name: ${{ parameters.pool }}
+    jobs:
+      - deployment: Deploy
+        displayName: 'Deploy to ${{ parameters.environment }}'
+        workspace:
+          clean: all
+        ${{ if and(eq(parameters.allowDataLoss, true), ne(parameters.dataLossEnvironment, '')) }}:
+          environment: ${{ parameters.dataLossEnvironment }}
+        ${{ if not(and(eq(parameters.allowDataLoss, true), ne(parameters.dataLossEnvironment, ''))) }}:
+          environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - template: steps-cd-sql.yml
+                  parameters:
+                    artifactName: ${{ parameters.artifactName }}
+                    sqlcmdPath: ${{ parameters.sqlcmdPath }}
+                    allowDataLoss: ${{ parameters.allowDataLoss }}
+                    dataLossJustification: ${{ parameters.dataLossJustification }}

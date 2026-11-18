@@ -1,0 +1,191 @@
+parameters:
+  - name: artifactName
+    type: string
+    default: 'ScriptReport'
+
+  - name: sqlcmdPath
+    type: string
+    default: 'C:\Tools\sqlcmd\sqlcmd.exe'
+
+  - name: allowDataLoss
+    type: boolean
+    default: false
+
+  - name: dataLossJustification
+    type: string
+    default: ' '
+
+steps:
+  # ==============================================================================
+  # SECCION 1: DESCARGAR PAQUETE DE DESPLIEGUE
+  # ==============================================================================
+  - download: current
+    artifact: '${{ parameters.artifactName }}-$(Build.BuildNumber)-$(Build.SourceBranchName)'
+    displayName: Descargar ScriptReport
+
+  # ==============================================================================
+  # SECCION 2: VALIDAR DESPLIEGUE
+  # ==============================================================================
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+
+      $server = '$(TargetServer)'
+      $database = '$(TargetDatabase)'
+      $sqlcmd = '${{ parameters.sqlcmdPath }}'
+
+      $artifactPath = Join-Path `
+          '$(Pipeline.Workspace)' `
+          '${{ parameters.artifactName }}-$(Build.BuildNumber)-$(Build.SourceBranchName)'
+
+      # Si una variable no existe, Azure DevOps deja el texto literal $(Nombre).
+      if ([string]::IsNullOrWhiteSpace($server) -or $server -match '^\$\(.+\)$') {
+          throw 'TargetServer es obligatorio y no está definido en el variable group.'
+      }
+
+      if ([string]::IsNullOrWhiteSpace($database) -or $database -match '^\$\(.+\)$') {
+          throw 'TargetDatabase es obligatorio y no está definido en el variable group.'
+      }
+
+      if (-not (Test-Path -LiteralPath $sqlcmd -PathType Leaf)) {
+          throw "sqlcmd no encontrado en: $sqlcmd"
+      }
+
+      if (-not (Test-Path -LiteralPath $artifactPath -PathType Container)) {
+          throw "No se encontró el artefacto en: $artifactPath"
+      }
+
+      $scripts = @(
+          Get-ChildItem `
+              -LiteralPath $artifactPath `
+              -Filter 'DeploymentScript.sql' `
+              -File `
+              -Recurse
+      )
+
+      if ($scripts.Count -ne 1) {
+          throw "Se esperaba exactamente un script y se encontraron $($scripts.Count)."
+      }
+
+      if ($scripts[0].Length -eq 0) {
+          throw 'El script SQL está vacío.'
+      }
+
+      # El script trae ':setvar DatabaseName' y un USE a esa base: debe ser TargetDatabase.
+      $setvarLine = Select-String `
+          -LiteralPath $scripts[0].FullName `
+          -Pattern '^:setvar\s+DatabaseName\s+"([^"]*)"' |
+          Select-Object -First 1
+
+      if (-not $setvarLine) {
+          throw 'El script no contiene :setvar DatabaseName; no se puede validar la base destino.'
+      }
+
+      $scriptDatabase = $setvarLine.Matches[0].Groups[1].Value
+
+      if ($scriptDatabase -ne $database) {
+          throw "El script se generó para la base '$scriptDatabase', pero TargetDatabase es '$database'."
+      }
+
+      Write-Host "Servidor: $server"
+      Write-Host "Base de datos: $database"
+      Write-Host "sqlcmd: $sqlcmd"
+      Write-Host "Script: $($scripts[0].FullName)"
+
+      Write-Host "##vso[task.setvariable variable=SqlcmdPath]$sqlcmd"
+      Write-Host "##vso[task.setvariable variable=DeploymentScript]$($scripts[0].FullName)"
+    displayName: Validar despliegue
+
+  # ==============================================================================
+  # SECCION 3: VALIDAR CONEXION
+  #   -S: Server
+  #   -d: Database
+  #   -E: Windows Authentication / Trusted Connection
+  #   -b: Termina con exit code de error
+  #   -Q: Ejecuta la consulta indicada y después cierra
+  # ==============================================================================
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+
+      & "$(SqlcmdPath)" `
+          -S '$(TargetServer)' `
+          -d master `
+          -E `
+          -b `
+          -Q "IF DB_ID(N'$(TargetDatabase)') IS NULL THROW 50000, 'La base de datos no existe.', 1;"
+
+      if ($LASTEXITCODE -ne 0) {
+          throw 'No fue posible validar la base de datos destino.'
+      }
+    displayName: Validar conexión SQL
+
+  # ==============================================================================
+  # SECCION 4: EJECUTAR SCRIPT
+  #   -S: Server
+  #   -d: Database
+  #   -E: Windows Authentication / Trusted Connection
+  #   -b: Termina con exit code de error
+  #   -r 1: Envía los mensajes de error a stderr en lugar de stdout.
+  #   -i: Input file.
+  # ==============================================================================
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+
+      if ($env:ALLOW_DATA_LOSS -eq 'True') {
+          Write-Host "##vso[task.logissue type=warning]Este despliegue permite posible pérdida de datos. Motivo: $("$env:DATA_LOSS_JUSTIFICATION".Trim())"
+      }
+
+      Write-Host "Ejecutando: $(DeploymentScript)"
+
+      & "$(SqlcmdPath)" `
+          -S '$(TargetServer)' `
+          -d '$(TargetDatabase)' `
+          -E `
+          -b `
+          -r 1 `
+          -i "$(DeploymentScript)"
+
+      if ($LASTEXITCODE -ne 0) {
+          throw "El despliegue falló."
+      }
+
+      Write-Host 'Despliegue completado correctamente.'
+    displayName: Ejecutar despliegue SQL
+    env:
+      ALLOW_DATA_LOSS: ${{ parameters.allowDataLoss }}
+      DATA_LOSS_JUSTIFICATION: ${{ parameters.dataLossJustification }}
+
+  # ==============================================================================
+  # SECCION 5: RESUMEN
+  # ==============================================================================
+  - powershell: |
+      Write-Host "Servidor:    $(TargetServer)"
+      Write-Host "Base:        $(TargetDatabase)"
+      Write-Host "Script:      $(DeploymentScript)"
+      Write-Host "Build:       $(Build.BuildNumber)"
+      Write-Host "Solicitante: $(Build.RequestedFor)"
+      Write-Host "Data loss:   $env:ALLOW_DATA_LOSS"
+
+      if ($env:ALLOW_DATA_LOSS -eq 'True') {
+          Write-Host "Motivo:      $("$env:DATA_LOSS_JUSTIFICATION".Trim())"
+      }
+    displayName: Resumen
+    condition: succeededOrFailed()
+    env:
+      ALLOW_DATA_LOSS: ${{ parameters.allowDataLoss }}
+      DATA_LOSS_JUSTIFICATION: ${{ parameters.dataLossJustification }}
+
+  # ==============================================================================
+  # SECCION 6: LIMPIAR AGENTE
+  # ==============================================================================
+  - powershell: |
+      $artifactPath = Join-Path `
+          '$(Pipeline.Workspace)' `
+          '${{ parameters.artifactName }}-$(Build.BuildNumber)-$(Build.SourceBranchName)'
+
+      Remove-Item `
+          -LiteralPath $artifactPath `
+          -Recurse `
+          -Force `
+          -ErrorAction SilentlyContinue
+    displayName: Limpiar ScriptReport
+    condition: always()

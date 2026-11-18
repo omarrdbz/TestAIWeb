@@ -1,0 +1,372 @@
+parameters:
+  - name: sourceArtifactName
+    type: string
+    default: 'Dacpac'
+
+  - name: artifactName
+    type: string
+    default: 'ScriptReport'
+
+  - name: sqlPackagePath
+    type: string
+    default: ''
+
+  - name: additionalSqlPackageArguments
+    type: string
+    default: ''
+
+  - name: prePublishSteps
+    type: stepList
+    default: []
+
+  - name: allowDataLoss
+    type: boolean
+    default: false
+
+  - name: dataLossJustification
+    type: string
+    default: ' '
+
+steps:
+
+  # ==============================================================================
+  # SECCION 1: VALIDAR ACEPTACION DE RIESGO
+  #   Solo se agrega cuando el pipeline se corre con allowDataLoss = true.
+  # ==============================================================================
+  - ${{ if eq(parameters.allowDataLoss, true) }}:
+    - powershell: |
+        $justification = "$env:DATA_LOSS_JUSTIFICATION".Trim()
+
+        if ($justification.Length -lt 10) {
+            Write-Host "##vso[task.logissue type=error]Se marcó allowDataLoss, pero falta la justificación (mínimo 10 caracteres)."
+            exit 1
+        }
+
+        Write-Host "##vso[task.logissue type=warning]Despliegue con posible pérdida de datos permitida. Solicitante: $(Build.RequestedFor). Motivo: $justification"
+      displayName: 'Validar aceptación de riesgo'
+      env:
+        DATA_LOSS_JUSTIFICATION: ${{ parameters.dataLossJustification }}
+
+  # ==============================================================================
+  # SECCION 2: DESCARGAR DACPAC
+  # ==============================================================================
+  - download: current
+    artifact: '${{ parameters.sourceArtifactName }}-$(Build.BuildNumber)-$(Build.SourceBranchName)'
+    displayName: 'Descargar DACPAC'
+
+  # ==============================================================================
+  # SECCION 3: VALIDAR SQLPACKAGE
+  # ==============================================================================
+  - powershell: |
+      $sqlPackage = '${{ parameters.sqlPackagePath }}'
+
+      if (-not [string]::IsNullOrWhiteSpace($sqlPackage)) {
+
+          if (-not (Test-Path $sqlPackage)) {
+              Write-Host "##vso[task.logissue type=error]SqlPackage no encontrado en: $sqlPackage"
+              exit 1
+          }
+
+          $resolvedSqlPackage = $sqlPackage
+      }
+      else {
+
+          $candidates = @(
+              "C:\Program Files\Microsoft SQL Server\170\DAC\bin\SqlPackage.exe",
+              "C:\Program Files\Microsoft SQL Server\160\DAC\bin\SqlPackage.exe",
+              "C:\Program Files\Microsoft SQL Server\150\DAC\bin\SqlPackage.exe"
+          )
+
+          $resolvedSqlPackage = $candidates |
+              Where-Object { Test-Path $_ } |
+              Select-Object -First 1
+      }
+
+      if (-not $resolvedSqlPackage) {
+          Write-Host "##vso[task.logissue type=error]No se encontró SqlPackage.exe."
+          exit 1
+      }
+
+      Write-Host "SqlPackage detectado:"
+      Write-Host $resolvedSqlPackage
+
+      Write-Host "##vso[task.setvariable variable=SqlPackagePath]$resolvedSqlPackage"
+
+      & $resolvedSqlPackage /Version
+    displayName: 'Validar SqlPackage'
+
+  # ==============================================================================
+  # SECCION 4: VALIDAR DESTINO
+  #   Verifica que ConnectionString apunte al mismo servidor y base de datos que
+  #   TargetServer y TargetDatabase, que son los que usa el stage de CD.
+  # ==============================================================================
+  - powershell: |
+      $connectionString = $env:TARGET_CONNECTION_STRING
+      $targetServer = '$(TargetServer)'
+      $targetDatabase = '$(TargetDatabase)'
+
+      $variables = [ordered]@{
+          ConnectionString = $connectionString
+          TargetServer     = $targetServer
+          TargetDatabase   = $targetDatabase
+      }
+
+      # Si una variable no existe, Azure DevOps deja el texto literal $(Nombre).
+      foreach ($name in $variables.Keys) {
+          $value = $variables[$name]
+
+          if ([string]::IsNullOrWhiteSpace($value) -or $value -match '^\$\(.+\)$') {
+              Write-Host "##vso[task.logissue type=error]La variable $name no está definida en el variable group."
+              exit 1
+          }
+      }
+
+      try {
+          $builder = [System.Data.SqlClient.SqlConnectionStringBuilder]::new($connectionString)
+      }
+      catch {
+          Write-Host "##vso[task.logissue type=error]ConnectionString no tiene un formato válido."
+          exit 1
+      }
+
+      if ($builder.DataSource -ne $targetServer) {
+          Write-Host "##vso[task.logissue type=error]El servidor de ConnectionString ($($builder.DataSource)) no coincide con TargetServer ($targetServer)."
+          exit 1
+      }
+
+      if ($builder.InitialCatalog -ne $targetDatabase) {
+          Write-Host "##vso[task.logissue type=error]La base de ConnectionString ($($builder.InitialCatalog)) no coincide con TargetDatabase ($targetDatabase)."
+          exit 1
+      }
+
+      Write-Host "Destino validado: $targetServer / $targetDatabase"
+    displayName: 'Validar destino'
+    env:
+      TARGET_CONNECTION_STRING: $(ConnectionString)
+
+  # ==============================================================================
+  # SECCION 5: LOCALIZAR DACPAC
+  # ==============================================================================
+  - powershell: |
+      $artifactRoot = "$(Pipeline.Workspace)\${{ parameters.sourceArtifactName }}-$(Build.BuildNumber)-$(Build.SourceBranchName)"
+
+      $metadataPath = Join-Path $artifactRoot 'build-metadata.json'
+
+      if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+          Write-Host "##vso[task.logissue type=error]No se encontró build-metadata.json en: $artifactRoot"
+          exit 1
+      }
+
+      $buildMetadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+
+      # Se usa el DACPAC que registró el CI; los demás .dacpac del artefacto son referencias.
+      $dacpacPath = Join-Path $artifactRoot $buildMetadata.dacpacName
+
+      if (-not (Test-Path -LiteralPath $dacpacPath -PathType Leaf)) {
+          Write-Host "##vso[task.logissue type=error]No se encontró el DACPAC indicado en la metadata: $dacpacPath"
+          exit 1
+      }
+
+      $dacpac = Get-Item -LiteralPath $dacpacPath
+      $hash = (Get-FileHash -LiteralPath $dacpac.FullName -Algorithm SHA256).Hash
+
+      if ($hash -ne $buildMetadata.sha256) {
+          Write-Host "##vso[task.logissue type=error]El hash del DACPAC no coincide con el registrado en el CI."
+          exit 1
+      }
+
+      Write-Host "DACPAC encontrado:"
+      Write-Host $dacpac.FullName
+
+      Write-Host "##vso[task.setvariable variable=ResolvedDacpacPath]$($dacpac.FullName)"
+      Write-Host "##vso[task.setvariable variable=ResolvedDacpacName]$($dacpac.Name)"
+
+    displayName: 'Localizar DACPAC'
+
+  # ==============================================================================
+  # SECCION 6: GENERAR SCRIPT Y DEPLOYMENT REPORT
+  # ==============================================================================
+  - powershell: |
+      $sqlPackage = "$(SqlPackagePath)"
+      $dacpac = "$(ResolvedDacpacPath)"
+
+      # BlockOnPossibleDataLoss queda en True salvo que se haya aceptado el riesgo.
+      $blockOnPossibleDataLoss = if ($env:ALLOW_DATA_LOSS -eq 'True') { 'False' } else { 'True' }
+      Write-Host "BlockOnPossibleDataLoss: $blockOnPossibleDataLoss"
+
+      $outputDirectory = "$(Build.ArtifactStagingDirectory)\deployment"
+
+      if (Test-Path $outputDirectory) {
+          Remove-Item `
+              -Path $outputDirectory `
+              -Recurse `
+              -Force
+      }
+
+      New-Item `
+          -Path $outputDirectory `
+          -ItemType Directory `
+          -Force | Out-Null
+
+      $deploymentScript =
+          Join-Path $outputDirectory "DeploymentScript.sql"
+
+      $deploymentReport =
+          Join-Path $outputDirectory "DeploymentReport.xml"
+
+      # Argumentos adicionales: se separan en un arreglo para que cada /p: llegue
+      # a SqlPackage como argumento independiente (y nada si viene vacío).
+      $additionalArgs = '${{ parameters.additionalSqlPackageArguments }}'
+      $extraArgs = @()
+      if (-not [string]::IsNullOrWhiteSpace($additionalArgs)) {
+          $extraArgs = @($additionalArgs.Trim() -split '\s+(?=/)')
+      }
+
+      Write-Host "Generando deployment report..."
+
+      & $sqlPackage `
+          /Action:DeployReport `
+          /SourceFile:"$dacpac" `
+          /TargetConnectionString:"$(ConnectionString)" `
+          /OutputPath:"$deploymentReport" `
+          "/p:BlockOnPossibleDataLoss=$blockOnPossibleDataLoss" `
+          /p:VerifyDeployment=True `
+          /p:CreateNewDatabase=False `
+          /p:ScriptDatabaseOptions=False `
+          @extraArgs
+
+      if ($LASTEXITCODE -ne 0) {
+          Write-Host "##vso[task.logissue type=error]Falló generación del deployment report."
+          exit 1
+      }
+
+      # Las alertas del reporte se muestran como warnings para quien revisa o aprueba.
+      [xml]$report = Get-Content -LiteralPath $deploymentReport -Raw
+      $dataLossAlerts = 0
+
+      foreach ($alert in @($report.DeploymentReport.Alerts.Alert | Where-Object { $_ })) {
+          foreach ($issue in @($alert.Issue | Where-Object { $_ })) {
+              Write-Host "##vso[task.logissue type=warning]$($alert.Name): $($issue.Value)"
+
+              if ($alert.Name -eq 'DataIssue') {
+                  $dataLossAlerts++
+              }
+          }
+      }
+
+      if ($dataLossAlerts -gt 0 -and $blockOnPossibleDataLoss -eq 'True') {
+          Write-Host "##vso[task.logissue type=warning]Hay $dataLossAlerts alerta(s) de posible pérdida de datos. Si las tablas afectadas tienen registros, el despliegue se detendrá. Para continuar, corre el pipeline manualmente con allowDataLoss y una justificación."
+      }
+
+      Write-Host "##vso[task.setvariable variable=DataLossAlerts]$dataLossAlerts"
+
+      Write-Host "Generando deployment script..."
+
+      & $sqlPackage `
+          /Action:Script `
+          /SourceFile:"$dacpac" `
+          /TargetConnectionString:"$(ConnectionString)" `
+          /OutputPath:"$deploymentScript" `
+          "/p:BlockOnPossibleDataLoss=$blockOnPossibleDataLoss" `
+          /p:VerifyDeployment=True `
+          /p:CreateNewDatabase=False `
+          /p:ScriptDatabaseOptions=False `
+          @extraArgs
+
+      if ($LASTEXITCODE -ne 0) {
+          Write-Host "##vso[task.logissue type=error]Falló generación del deployment script."
+          exit 1
+      }
+
+      Write-Host "Script generado:"
+      Write-Host $deploymentScript
+
+      Write-Host "Deployment report generado:"
+      Write-Host $deploymentReport
+
+      Write-Host "##vso[task.setvariable variable=DeploymentScriptPath]$deploymentScript"
+      Write-Host "##vso[task.setvariable variable=DeploymentReportPath]$deploymentReport"
+    displayName: 'Generar Script SQL y Deployment Report'
+    env:
+      ALLOW_DATA_LOSS: ${{ parameters.allowDataLoss }}
+
+  # ==============================================================================
+  # SECCION 7: GENERAR METADATA
+  # ==============================================================================
+  - powershell: |
+      $metadataPath =
+          "$(Build.ArtifactStagingDirectory)\deployment\deployment-metadata.json"
+
+      $scriptHash =
+          (Get-FileHash `
+              -Path "$(DeploymentScriptPath)" `
+              -Algorithm SHA256).Hash
+
+      $reportHash =
+          (Get-FileHash `
+              -Path "$(DeploymentReportPath)" `
+              -Algorithm SHA256).Hash
+
+      $metadata = [ordered]@{
+
+          buildId               = "$(Build.BuildId)"
+          buildNumber           = "$(Build.BuildNumber)"
+          sourceBranch          = "$(Build.SourceBranch)"
+          sourceVersion         = "$(Build.SourceVersion)"
+
+          requestedFor          = "$(Build.RequestedFor)"
+
+          dacpacName            = "$(ResolvedDacpacName)"
+
+          deploymentScriptHash  = $scriptHash
+          deploymentReportHash  = $reportHash
+
+          allowDataLoss         = ($env:ALLOW_DATA_LOSS -eq 'True')
+          dataLossJustification = "$env:DATA_LOSS_JUSTIFICATION".Trim()
+          dataLossAlerts        = [int]'$(DataLossAlerts)'
+
+          generatedAtUtc        = [DateTime]::UtcNow.ToString("o")
+      }
+
+      $metadata |
+          ConvertTo-Json -Depth 5 |
+          Set-Content `
+              -Path $metadataPath `
+              -Encoding UTF8
+
+      Write-Host "Metadata generado:"
+      Get-Content $metadataPath
+
+    displayName: 'Generar metadata'
+    env:
+      ALLOW_DATA_LOSS: ${{ parameters.allowDataLoss }}
+      DATA_LOSS_JUSTIFICATION: ${{ parameters.dataLossJustification }}
+
+  # ==============================================================================
+  # SECCION 8: STEPS ADICIONALES
+  # ==============================================================================
+  - ${{ each step in parameters.prePublishSteps }}:
+    - ${{ step }}
+
+  # ==============================================================================
+  # SECCION 9: PUBLICAR ARTEFACTOS
+  # ==============================================================================
+  - publish: '$(Build.ArtifactStagingDirectory)\deployment'
+    artifact: '${{ parameters.artifactName }}-$(Build.BuildNumber)-$(Build.SourceBranchName)'
+    displayName: 'Publicar Deployment Package'
+
+  # ==============================================================================
+  # SECCION 10: LIMPIAR DACPAC DEL AGENTE
+  # ==============================================================================
+  - powershell: |
+      $artifactPath = Join-Path `
+          '$(Pipeline.Workspace)' `
+          '${{ parameters.sourceArtifactName }}-$(Build.BuildNumber)-$(Build.SourceBranchName)'
+
+      Remove-Item `
+          -LiteralPath $artifactPath `
+          -Recurse `
+          -Force `
+          -ErrorAction SilentlyContinue
+    displayName: 'Limpiar DACPAC'
+    condition: always()

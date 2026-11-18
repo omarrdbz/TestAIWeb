@@ -1,0 +1,53 @@
+name: '$(Date:yyyyMMdd).$(Rev:r)'
+
+# Parámetros que se eligen al correr el pipeline a mano.
+# El trigger por commit siempre usa los valores por defecto (no se permite pérdida de datos).
+parameters:
+  - name: allowDataLoss
+    displayName: 'Permitir posible pérdida de datos (acepto el riesgo)'
+    type: boolean
+    default: false
+
+  - name: dataLossJustification
+    displayName: 'Justificación (obligatoria si se permite pérdida de datos)'
+    type: string
+    default: ' '   # Un espacio: Azure DevOps exige un valor por defecto no vacío.
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    exclude:
+      - '**/*.md'
+      - '**/*.yml'
+      - '**/.gitignore'
+
+pr: none
+
+stages:
+  - template: ../Templates/stage-ci-sql.yml
+    parameters:
+      artifactName: 'CICDPipelineTest_Dacpac'
+      sqlProjectPath: 'Database1/Database1.sqlproj'
+
+  - template: ../Templates/stage-sql-deployment-package.yml
+    parameters:
+      sourceArtifactName: 'CICDPipelineTest_Dacpac'
+      pool: 'Pool-QA'
+      variableGroupCD: 'vg-cicdpipelinetest-cd-sql-staging'
+      sqlPackagePath: 'C:\Tools\SqlPackage\SqlPackage.exe'
+      additionalSqlPackageArguments: '/p:ExcludeObjectTypes=Logins;Users;Permissions;RoleMembership;DatabaseRoles;ApplicationRoles;Audits'
+      allowDataLoss: ${{ parameters.allowDataLoss }}
+      dataLossJustification: ${{ parameters.dataLossJustification }}
+
+  - template: ../Templates/stage-cd-sql.yml
+    parameters:
+      environment: 'QA_BD'
+      pool: 'Pool-QA'
+      variableGroupCD: 'vg-cicdpipelinetest-cd-sql-staging'
+      sqlcmdPath: 'C:\Tools\sqlcmd\sqlcmd.exe'
+      allowDataLoss: ${{ parameters.allowDataLoss }}
+      dataLossJustification: ${{ parameters.dataLossJustification }}
+      # Opcional: environment con aprobadores distintos para despliegues con pérdida de datos.
+      # dataLossEnvironment: 'QA_BD_DataLoss'

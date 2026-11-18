@@ -1,0 +1,65 @@
+parameters:
+  - name: sourceArtifactName
+    type: string
+    default: 'Dacpac'
+
+  - name: artifactName
+    type: string
+    default: 'ScriptReport'
+
+  - name: variableGroupCD
+    type: string
+
+  - name: sqlPackagePath
+    type: string
+    default: ''
+
+  - name: additionalSqlPackageArguments
+    type: string
+    default: ''
+
+  - name: pool
+    type: string
+
+  - name: dependsOn
+    type: string
+    default: 'CI_SQL_PROJECT'
+
+  - name: condition
+    type: string
+    default: 'succeeded()'
+
+  - name: prePublishSteps
+    type: stepList
+    default: []
+
+  - name: allowDataLoss
+    type: boolean
+    default: false
+
+  - name: dataLossJustification
+    type: string
+    default: ' '
+
+stages:
+  - stage: DEPLOYMENT_PACKAGE
+    displayName: 'Script and report package'
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    variables:
+      - group: ${{ parameters.variableGroupCD }}
+    pool:
+      name: ${{ parameters.pool }}
+    jobs:
+      - job: Deployment_Package
+        displayName: 'Generate deployment package'
+        steps:
+          - template: steps-sql-deployment-package.yml
+            parameters:
+              sourceArtifactName: ${{ parameters.sourceArtifactName }}
+              artifactName: ${{ parameters.artifactName }}
+              sqlPackagePath: ${{ parameters.sqlPackagePath }}
+              additionalSqlPackageArguments: ${{ parameters.additionalSqlPackageArguments }}
+              prePublishSteps: ${{ parameters.prePublishSteps }}
+              allowDataLoss: ${{ parameters.allowDataLoss }}
+              dataLossJustification: ${{ parameters.dataLossJustification }}

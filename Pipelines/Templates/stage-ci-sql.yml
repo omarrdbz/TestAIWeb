@@ -1,0 +1,40 @@
+parameters:
+  - name: vmImage
+    type: string
+    default: 'windows-latest'
+
+  - name: artifactName
+    type: string
+    default: 'Dacpac'
+
+  - name: sqlProjectPath
+    type: string
+
+  - name: dacpacOutputDirectory
+    type: string
+    default: '$(Build.ArtifactStagingDirectory)\Dacpac'
+
+  - name: buildConfiguration
+    type: string
+    default: 'Release'
+
+  - name: prePublishSteps
+    type: stepList
+    default: []
+
+stages:
+  - stage: CI_SQL_PROJECT
+    displayName: 'CI - SQL Project'
+    pool:
+      vmImage: ${{ parameters.vmImage }}
+    jobs:
+      - job: CI_SQL_PROJECT
+        displayName: 'Build DACPAC package'
+        steps:
+          - template: steps-ci-sql.yml
+            parameters:
+              artifactName: ${{ parameters.artifactName }}
+              sqlProjectPath: ${{ parameters.sqlProjectPath }}
+              dacpacOutputDirectory: ${{ parameters.dacpacOutputDirectory }}
+              buildConfiguration: ${{ parameters.buildConfiguration }}
+              prePublishSteps: ${{ parameters.prePublishSteps }}
