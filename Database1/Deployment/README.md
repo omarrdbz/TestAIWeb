@@ -46,7 +46,8 @@ Deployment/
    `Script.PreDeployment.sql` o `Script.PostDeployment.sql`.
 5. Verifica que el archivo quede con **Build Action = None** en Visual Studio
    (Propiedades del archivo). Si queda en *Build*, el proyecto no compila.
-6. Compila el proyecto localmente y abre el pull request.
+6. Compila el proyecto localmente y abre el pull request. El pipeline de PR
+   revisa automáticamente las reglas de abajo (ver *Validación automática*).
 
 ## Reglas
 
@@ -64,6 +65,47 @@ Deployment/
   siguiente despliegue.
 - **No metas DDL aquí** (tablas, columnas, índices, procedimientos). El esquema se
   cambia en los archivos del proyecto.
+
+## Validación automática
+
+El pipeline de PR y el de CI revisan estos puntos antes de compilar; si alguno
+falla, el build falla con un mensaje que indica el archivo y el problema:
+
+- El `.sqlproj` tiene exactamente un `PreDeploy` y un `PostDeploy` apuntando a
+  los scripts de esta carpeta, y ningún archivo de `Deployment\` está como *Build*.
+- El `.sqlproj` declara las variables SQLCMD `BuildNumber` y `RequestedFor`.
+- El primer `:r` del pre-deployment es `.\Infra\ScriptHistory.sql`.
+- Cada `:r` apunta a un archivo que existe y ninguno se incluye dos veces.
+- Cada script de `Pre\` y `Post\` está incluido con `:r`, y desde la fase que
+  corresponde a su carpeta (un script sin `:r` nunca se ejecutaría).
+- Todos los scripts terminan con `GO`.
+- Scripts de una vez: nombre `AAAA-MM-DD_NNN_descripcion.sql`, `@ScriptId` igual
+  al nombre del archivo, `@Phase` igual a la carpeta (`PRE`/`POST`) y sin Ids
+  repetidos.
+- Aviso (no falla): los scripts de una vez no están incluidos en orden de nombre.
+
+## Trazabilidad
+
+Cada script de una vez queda registrado en `deploy.ScriptHistory` con:
+
+| Columna | Origen |
+|---|---|
+| `ScriptId`, `Phase` | El script |
+| `ExecutedAtUtc` | Hora del servidor al ejecutarse |
+| `ExecutedBy` | Cuenta que ejecutó el despliegue (la del agente) |
+| `BuildNumber` | Número de la ejecución del pipeline, `$(BuildNumber)` |
+| `RequestedFor` | Quien lanzó el pipeline o hizo el commit, `$(RequestedFor)` |
+
+Para saber en qué despliegue corrió un script:
+
+```sql
+SELECT ScriptId, Phase, ExecutedAtUtc, BuildNumber, RequestedFor
+FROM deploy.ScriptHistory
+ORDER BY ExecutedAtUtc DESC;
+```
+
+Si publicas el proyecto desde Visual Studio, las variables toman el valor
+`local`.
 
 ## Casos especiales
 
@@ -138,9 +180,24 @@ Configuración que se agrega una sola vez al proyecto:
   <None Include="Deployment\_Plantillas\*.sql" />
   <None Include="Deployment\README.md" />
 </ItemGroup>
+
+<ItemGroup>
+  <SqlCmdVariable Include="BuildNumber">
+    <DefaultValue>local</DefaultValue>
+    <Value>$(SqlCmdVar__1)</Value>
+  </SqlCmdVariable>
+  <SqlCmdVariable Include="RequestedFor">
+    <DefaultValue>local</DefaultValue>
+    <Value>$(SqlCmdVar__2)</Value>
+  </SqlCmdVariable>
+</ItemGroup>
 ```
 
 Solo puede haber **un** `PreDeploy` y **un** `PostDeploy` por proyecto.
+
+Si el proyecto ya tiene otras variables SQLCMD, usa números `SqlCmdVar__N` que no
+estén ocupados. También se pueden agregar desde Visual Studio: Propiedades del
+proyecto → *SQLCMD Variables*.
 
 Si el proyecto es SDK-style (`<Project Sdk="Microsoft.Build.Sql">`), todos los
 `.sql` se compilan por defecto; agrega además:

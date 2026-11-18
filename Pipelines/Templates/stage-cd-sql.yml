@@ -13,6 +13,11 @@ parameters:
     type: string
     default: 'C:\Tools\sqlcmd\sqlcmd.exe'
 
+  # Ruta explícita de SqlPackage (se usa para verificar que el script siga vigente).
+  - name: sqlPackagePath
+    type: string
+    default: ''
+
   - name: variableGroupCD
     type: string
 
@@ -38,6 +43,15 @@ parameters:
     type: string
     default: ''
 
+  # Respaldo COPY_ONLY antes de ejecutar (requiere BackupDirectory en el variable group).
+  - name: backupBeforeDeploy
+    type: boolean
+    default: false
+
+  - name: timeoutInMinutes
+    type: number
+    default: 60
+
 stages:
   - stage: CD_${{ parameters.environment }}
     displayName: 'CD - Deploy to ${{ parameters.environment }}'
@@ -50,6 +64,7 @@ stages:
     jobs:
       - deployment: Deploy
         displayName: 'Deploy to ${{ parameters.environment }}'
+        timeoutInMinutes: ${{ parameters.timeoutInMinutes }}
         workspace:
           clean: all
         ${{ if and(eq(parameters.allowDataLoss, true), ne(parameters.dataLossEnvironment, '')) }}:
@@ -64,5 +79,7 @@ stages:
                   parameters:
                     artifactName: ${{ parameters.artifactName }}
                     sqlcmdPath: ${{ parameters.sqlcmdPath }}
+                    sqlPackagePath: ${{ parameters.sqlPackagePath }}
+                    backupBeforeDeploy: ${{ parameters.backupBeforeDeploy }}
                     allowDataLoss: ${{ parameters.allowDataLoss }}
                     dataLossJustification: ${{ parameters.dataLossJustification }}

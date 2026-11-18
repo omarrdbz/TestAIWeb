@@ -1,0 +1,46 @@
+# Ubica SqlPackage.exe y lo deja en la variable SqlPackagePath.
+# Lo usan el stage de paquete y el de CD.
+parameters:
+  # Ruta explícita. Vacío = buscar en las rutas de instalación conocidas.
+  - name: sqlPackagePath
+    type: string
+    default: ''
+
+steps:
+  - powershell: |
+      $sqlPackage = '${{ parameters.sqlPackagePath }}'
+
+      if (-not [string]::IsNullOrWhiteSpace($sqlPackage)) {
+
+          if (-not (Test-Path $sqlPackage)) {
+              Write-Host "##vso[task.logissue type=error]SqlPackage no encontrado en: $sqlPackage"
+              exit 1
+          }
+
+          $resolvedSqlPackage = $sqlPackage
+      }
+      else {
+
+          $candidates = @(
+              "C:\Program Files\Microsoft SQL Server\170\DAC\bin\SqlPackage.exe",
+              "C:\Program Files\Microsoft SQL Server\160\DAC\bin\SqlPackage.exe",
+              "C:\Program Files\Microsoft SQL Server\150\DAC\bin\SqlPackage.exe"
+          )
+
+          $resolvedSqlPackage = $candidates |
+              Where-Object { Test-Path $_ } |
+              Select-Object -First 1
+      }
+
+      if (-not $resolvedSqlPackage) {
+          Write-Host "##vso[task.logissue type=error]No se encontró SqlPackage.exe."
+          exit 1
+      }
+
+      Write-Host "SqlPackage detectado:"
+      Write-Host $resolvedSqlPackage
+
+      Write-Host "##vso[task.setvariable variable=SqlPackagePath]$resolvedSqlPackage"
+
+      & $resolvedSqlPackage /Version
+    displayName: 'Validar SqlPackage'

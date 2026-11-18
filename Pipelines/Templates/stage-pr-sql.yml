@@ -1,0 +1,40 @@
+parameters:
+  - name: vmImage
+    type: string
+    default: 'windows-latest'
+
+  - name: sqlProjectPath
+    type: string
+
+  - name: dacpacOutputDirectory
+    type: string
+    default: '$(Build.ArtifactStagingDirectory)\Dacpac'
+
+  - name: buildConfiguration
+    type: string
+    default: 'Release'
+
+  - name: deploymentFolder
+    type: string
+    default: 'Deployment'
+
+  - name: timeoutInMinutes
+    type: number
+    default: 60
+
+stages:
+  - stage: PR_SQL_VALIDATION
+    displayName: 'PR - Validar SQL Project'
+    pool:
+      vmImage: ${{ parameters.vmImage }}
+    jobs:
+      - job: PR_SQL_VALIDATION
+        displayName: 'Validar y compilar'
+        timeoutInMinutes: ${{ parameters.timeoutInMinutes }}
+        steps:
+          - template: steps-pr-sql.yml
+            parameters:
+              sqlProjectPath: ${{ parameters.sqlProjectPath }}
+              dacpacOutputDirectory: ${{ parameters.dacpacOutputDirectory }}
+              buildConfiguration: ${{ parameters.buildConfiguration }}
+              deploymentFolder: ${{ parameters.deploymentFolder }}

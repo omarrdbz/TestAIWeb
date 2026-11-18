@@ -1,0 +1,39 @@
+parameters:
+  - name: sqlProjectPath
+    type: string
+
+  - name: dacpacOutputDirectory
+    type: string
+    default: '$(Build.ArtifactStagingDirectory)\Dacpac'
+
+  - name: buildConfiguration
+    type: string
+    default: 'Release'
+
+  - name: deploymentFolder
+    type: string
+    default: 'Deployment'
+
+steps:
+  # ==============================================================================
+  # SECCIONES 1-4: VALIDAR, COMPILAR Y LOCALIZAR DACPAC (compartido con CI)
+  # ==============================================================================
+  - template: steps-build-sql.yml
+    parameters:
+      sqlProjectPath: ${{ parameters.sqlProjectPath }}
+      dacpacOutputDirectory: ${{ parameters.dacpacOutputDirectory }}
+      buildConfiguration: ${{ parameters.buildConfiguration }}
+      deploymentFolder: ${{ parameters.deploymentFolder }}
+
+  # ==============================================================================
+  # SECCION 5: RESUMEN
+  #   En PR no se publica nada: solo se valida que el cambio compile y que los
+  #   scripts de pre/post cumplan las reglas.
+  # ==============================================================================
+  - powershell: |
+      Write-Host "Proyecto:   ${{ parameters.sqlProjectPath }}"
+      Write-Host "DACPAC:     $(ResolvedDacpacName)"
+      Write-Host "SHA256:     $(ResolvedDacpacHash)"
+      Write-Host "Rama:       $(System.PullRequest.SourceBranch) -> $(System.PullRequest.TargetBranch)"
+      Write-Host 'Validación de PR completada.'
+    displayName: 'Resumen'

@@ -7,6 +7,11 @@ parameters:
     type: string
     default: 'C:\Tools\sqlcmd\sqlcmd.exe'
 
+  # Ruta explícita de SqlPackage. Vacío = buscar en las rutas de instalación conocidas.
+  - name: sqlPackagePath
+    type: string
+    default: ''
+
   - name: allowDataLoss
     type: boolean
     default: false
@@ -14,6 +19,12 @@ parameters:
   - name: dataLossJustification
     type: string
     default: ' '
+
+  # Respaldo COPY_ONLY antes de ejecutar. Requiere la variable BackupDirectory
+  # en el variable group (ruta vista desde el servidor SQL, p. ej. \\srv\respaldos).
+  - name: backupBeforeDeploy
+    type: boolean
+    default: false
 
 steps:
   # ==============================================================================
@@ -25,6 +36,7 @@ steps:
 
   # ==============================================================================
   # SECCION 2: VALIDAR DESPLIEGUE
+  #   Variables, archivos del paquete, integridad (hashes) y base destino del script.
   # ==============================================================================
   - powershell: |
       $ErrorActionPreference = 'Stop'
@@ -70,7 +82,47 @@ steps:
           throw 'El script SQL está vacío.'
       }
 
+      # ---------------------------------------------------------------------------
+      # Archivos del paquete
+      # ---------------------------------------------------------------------------
+      $packageRoot = $scripts[0].DirectoryName
+      $reportPath = Join-Path $packageRoot 'DeploymentReport.xml'
+      $metadataPath = Join-Path $packageRoot 'deployment-metadata.json'
+      $optionsPath = Join-Path $packageRoot 'sqlpackage-options.json'
+
+      foreach ($required in @($reportPath, $metadataPath, $optionsPath)) {
+          if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Falta $(Split-Path -Leaf $required) en el paquete de despliegue."
+          }
+      }
+
+      $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+      $dacpacPath = Join-Path (Join-Path $packageRoot 'dacpac') $metadata.dacpacName
+
+      if (-not (Test-Path -LiteralPath $dacpacPath -PathType Leaf)) {
+          throw "Falta el DACPAC $($metadata.dacpacName) en el paquete de despliegue."
+      }
+
+      # ---------------------------------------------------------------------------
+      # Integridad: los archivos son los mismos que se generaron y aprobaron
+      # ---------------------------------------------------------------------------
+      $checks = @(
+          @{ Name = 'DeploymentScript.sql'; Path = $scripts[0].FullName; Expected = $metadata.deploymentScriptHash },
+          @{ Name = 'DeploymentReport.xml'; Path = $reportPath;          Expected = $metadata.deploymentReportHash },
+          @{ Name = $metadata.dacpacName;   Path = $dacpacPath;          Expected = $metadata.dacpacHash }
+      )
+
+      foreach ($check in $checks) {
+          $actual = (Get-FileHash -LiteralPath $check.Path -Algorithm SHA256).Hash
+
+          if ($actual -ne $check.Expected) {
+              throw "$($check.Name) no coincide con el hash registrado al generar el paquete."
+          }
+      }
+
+      # ---------------------------------------------------------------------------
       # El script trae ':setvar DatabaseName' y un USE a esa base: debe ser TargetDatabase.
+      # ---------------------------------------------------------------------------
       $setvarLine = Select-String `
           -LiteralPath $scripts[0].FullName `
           -Pattern '^:setvar\s+DatabaseName\s+"([^"]*)"' |
@@ -90,9 +142,13 @@ steps:
       Write-Host "Base de datos: $database"
       Write-Host "sqlcmd: $sqlcmd"
       Write-Host "Script: $($scripts[0].FullName)"
+      Write-Host "Integridad del paquete verificada (script, reporte y DACPAC)."
 
       Write-Host "##vso[task.setvariable variable=SqlcmdPath]$sqlcmd"
       Write-Host "##vso[task.setvariable variable=DeploymentScript]$($scripts[0].FullName)"
+      Write-Host "##vso[task.setvariable variable=DeploymentReport]$reportPath"
+      Write-Host "##vso[task.setvariable variable=DeploymentOptions]$optionsPath"
+      Write-Host "##vso[task.setvariable variable=DeploymentDacpac]$dacpacPath"
     displayName: Validar despliegue
 
   # ==============================================================================
@@ -119,13 +175,148 @@ steps:
     displayName: Validar conexión SQL
 
   # ==============================================================================
-  # SECCION 4: EJECUTAR SCRIPT
+  # SECCION 4: VALIDAR SQLPACKAGE
+  # ==============================================================================
+  - template: steps-resolve-sqlpackage.yml
+    parameters:
+      sqlPackagePath: ${{ parameters.sqlPackagePath }}
+
+  # ==============================================================================
+  # SECCION 5: VERIFICAR QUE EL SCRIPT SIGA VIGENTE
+  #   Entre que se genera el paquete y se aprueba el environment puede pasar
+  #   tiempo. Se vuelve a generar el deployment report contra el estado actual de
+  #   la base, con el mismo DACPAC y las mismas opciones, y se compara con el
+  #   aprobado. Si la base cambió, el script ya no corresponde y no se ejecuta.
+  # ==============================================================================
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+
+      function Get-ReportLines([string]$Path) {
+          [xml]$xml = Get-Content -LiteralPath $Path -Raw
+          $lines = New-Object System.Collections.Generic.List[string]
+
+          foreach ($operation in @($xml.DeploymentReport.Operations.Operation | Where-Object { $_ })) {
+              foreach ($item in @($operation.Item | Where-Object { $_ })) {
+                  $lines.Add("$($operation.Name) | $($item.Type) | $($item.Value)")
+              }
+          }
+
+          foreach ($alert in @($xml.DeploymentReport.Alerts.Alert | Where-Object { $_ })) {
+              foreach ($issue in @($alert.Issue | Where-Object { $_ })) {
+                  $lines.Add("Alerta $($alert.Name) | $($issue.Value)")
+              }
+          }
+
+          $lines.Sort([System.StringComparer]::Ordinal)
+          return ,$lines.ToArray()
+      }
+
+      # ConvertFrom-Json en Windows PowerShell devuelve el arreglo como un solo objeto.
+      $options = [string[]](Get-Content -LiteralPath "$(DeploymentOptions)" -Raw | ConvertFrom-Json)
+      $currentReport = Join-Path "$(Agent.TempDirectory)" 'CurrentDeploymentReport.xml'
+
+      Write-Host 'Generando deployment report contra el estado actual de la base...'
+
+      & "$(SqlPackagePath)" `
+          /Action:DeployReport `
+          "/SourceFile:$(DeploymentDacpac)" `
+          "/TargetConnectionString:$env:TARGET_CONNECTION_STRING" `
+          "/OutputPath:$currentReport" `
+          @options
+
+      if ($LASTEXITCODE -ne 0) {
+          throw 'Falló la generación del deployment report de verificación.'
+      }
+
+      $approved = Get-ReportLines "$(DeploymentReport)"
+      $current = Get-ReportLines $currentReport
+
+      if (($approved -join "`n") -cne ($current -join "`n")) {
+          Write-Host 'Diferencias entre el reporte aprobado y el estado actual:'
+
+          foreach ($line in @($approved | Where-Object { $current -notcontains $_ })) {
+              Write-Host "  - Ya no aplica: $line"
+          }
+
+          foreach ($line in @($current | Where-Object { $approved -notcontains $_ })) {
+              Write-Host "  + Nuevo:        $line"
+          }
+
+          Write-Host '##vso[task.logissue type=error]La base destino cambió desde que se generó y aprobó el script. Vuelve a correr el pipeline para generar un paquete nuevo.'
+          exit 1
+      }
+
+      Write-Host "El script sigue vigente: $($approved.Count) operación(es) y alerta(s) sin cambios."
+    displayName: Verificar vigencia del script
+    env:
+      TARGET_CONNECTION_STRING: $(ConnectionString)
+
+  # ==============================================================================
+  # SECCION 6: RESPALDO COPY_ONLY
+  #   Solo se agrega con backupBeforeDeploy = true.
+  #   COPY_ONLY no altera la cadena de respaldos del DBA. El archivo lo escribe el
+  #   servicio de SQL Server: su cuenta necesita permiso de escritura en BackupDirectory.
+  # ==============================================================================
+  - ${{ if eq(parameters.backupBeforeDeploy, true) }}:
+    - powershell: |
+        $ErrorActionPreference = 'Stop'
+
+        $database = '$(TargetDatabase)'
+        $backupDirectory = '$(BackupDirectory)'
+
+        if ([string]::IsNullOrWhiteSpace($backupDirectory) -or $backupDirectory -match '^\$\(.+\)$') {
+            throw 'backupBeforeDeploy está activo, pero la variable BackupDirectory no está definida en el variable group.'
+        }
+
+        $timestamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd_HHmmss')
+        $fileName = '{0}_{1}_{2}.bak' -f $database, $env:BUILD_NUMBER, $timestamp
+        $backupFile = $backupDirectory.TrimEnd('\') + '\' + $fileName
+
+        # COMPRESSION no existe en SQL Server Express (EngineEdition = 4).
+        $sql = @"
+        SET NOCOUNT ON;
+
+        DECLARE @sql nvarchar(max) =
+            N'BACKUP DATABASE ' + QUOTENAME(N'$($database.Replace("'", "''"))') +
+            N' TO DISK = @file WITH COPY_ONLY, CHECKSUM, INIT, STATS = 10' +
+            CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) = 4 THEN N'' ELSE N', COMPRESSION' END +
+            N';';
+
+        EXEC sys.sp_executesql @sql, N'@file nvarchar(4000)', @file = N'$($backupFile.Replace("'", "''"))';
+        "@
+
+        $sqlFile = Join-Path "$(Agent.TempDirectory)" 'backup-before-deploy.sql'
+        Set-Content -LiteralPath $sqlFile -Value $sql -Encoding UTF8
+
+        Write-Host "Respaldando [$database] en: $backupFile"
+
+        & "$(SqlcmdPath)" `
+            -S '$(TargetServer)' `
+            -d master `
+            -E `
+            -b `
+            -r 1 `
+            -i $sqlFile
+
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Falló el respaldo previo al despliegue. No se ejecutó el script.'
+        }
+
+        Write-Host "Respaldo completado: $backupFile"
+        Write-Host "##vso[task.setvariable variable=BackupFile]$backupFile"
+      displayName: Respaldo COPY_ONLY
+      env:
+        BUILD_NUMBER: $(Build.BuildNumber)
+
+  # ==============================================================================
+  # SECCION 7: EJECUTAR SCRIPT
   #   -S: Server
   #   -d: Database
   #   -E: Windows Authentication / Trusted Connection
   #   -b: Termina con exit code de error
   #   -r 1: Envía los mensajes de error a stderr en lugar de stdout.
   #   -i: Input file.
+  #   -h -1 / -W: Sin encabezados ni espacios (para leer la hora del servidor).
   # ==============================================================================
   - powershell: |
       $ErrorActionPreference = 'Stop'
@@ -133,6 +324,26 @@ steps:
       if ($env:ALLOW_DATA_LOSS -eq 'True') {
           Write-Host "##vso[task.logissue type=warning]Este despliegue permite posible pérdida de datos. Motivo: $("$env:DATA_LOSS_JUSTIFICATION".Trim())"
       }
+
+      # Hora del servidor justo antes de ejecutar: es el punto al que se restauraría
+      # con RESTORE ... WITH STOPAT si hubiera que regresar la base.
+      $serverTime = & "$(SqlcmdPath)" `
+          -S '$(TargetServer)' `
+          -d master `
+          -E `
+          -b `
+          -h -1 `
+          -W `
+          -Q "SET NOCOUNT ON; SELECT CONVERT(varchar(33), SYSDATETIMEOFFSET(), 126);"
+
+      if ($LASTEXITCODE -ne 0) {
+          throw 'No fue posible obtener la hora del servidor.'
+      }
+
+      $serverTime = @($serverTime | Where-Object { $_ -and $_.Trim() })[0].Trim()
+
+      Write-Host "Hora del servidor al iniciar (referencia para STOPAT): $serverTime"
+      Write-Host "##vso[task.setvariable variable=DeploymentStartServerTime]$serverTime"
 
       Write-Host "Ejecutando: $(DeploymentScript)"
 
@@ -155,12 +366,17 @@ steps:
       DATA_LOSS_JUSTIFICATION: ${{ parameters.dataLossJustification }}
 
   # ==============================================================================
-  # SECCION 5: RESUMEN
+  # SECCION 8: RESUMEN
   # ==============================================================================
   - powershell: |
+      # Si un paso no llegó a definir su variable, Azure DevOps deja el texto $(Nombre).
+      function Get-Value([string]$Value) {
+          if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match '^\$\(.+\)$') { '-' } else { $Value }
+      }
+
       Write-Host "Servidor:    $(TargetServer)"
       Write-Host "Base:        $(TargetDatabase)"
-      Write-Host "Script:      $(DeploymentScript)"
+      Write-Host "Script:      $(Get-Value '$(DeploymentScript)')"
       Write-Host "Build:       $(Build.BuildNumber)"
       Write-Host "Solicitante: $(Build.RequestedFor)"
       Write-Host "Data loss:   $env:ALLOW_DATA_LOSS"
@@ -168,6 +384,9 @@ steps:
       if ($env:ALLOW_DATA_LOSS -eq 'True') {
           Write-Host "Motivo:      $("$env:DATA_LOSS_JUSTIFICATION".Trim())"
       }
+
+      Write-Host "Respaldo:    $(Get-Value '$(BackupFile)')"
+      Write-Host "Inicio:      $(Get-Value '$(DeploymentStartServerTime)')"
     displayName: Resumen
     condition: succeededOrFailed()
     env:
@@ -175,7 +394,7 @@ steps:
       DATA_LOSS_JUSTIFICATION: ${{ parameters.dataLossJustification }}
 
   # ==============================================================================
-  # SECCION 6: LIMPIAR AGENTE
+  # SECCION 9: LIMPIAR AGENTE
   # ==============================================================================
   - powershell: |
       $artifactPath = Join-Path `

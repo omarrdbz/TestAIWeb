@@ -1,0 +1,25 @@
+# Validación de pull requests del SQL Project.
+#
+# Azure Repos: la sección pr: se ignora. Configurar este pipeline como
+# "Build validation" en la política de la rama main
+# (Repos > Branches > main > Branch policies > Build validation).
+# Ahí también se puede poner el filtro de rutas, por ejemplo: /Database1/*; /Pipelines/*
+#
+# GitHub: la sección pr: de abajo dispara el pipeline en cada PR hacia main.
+name: 'PR.$(Date:yyyyMMdd).$(Rev:r)'
+
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - Database1
+      - Pipelines
+
+stages:
+  - template: ../Templates/stage-pr-sql.yml
+    parameters:
+      sqlProjectPath: 'Database1/Database1.sqlproj'

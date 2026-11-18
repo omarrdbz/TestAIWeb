@@ -14,96 +14,49 @@ parameters:
     type: string
     default: 'Release'
 
+  - name: deploymentFolder
+    type: string
+    default: 'Deployment'
+
   - name: prePublishSteps
     type: stepList
     default: []
 
 steps:
   # ==============================================================================
-  # SECCION 1: VALIDACION DEL PROJECT PATH
+  # SECCIONES 1-4: VALIDAR, COMPILAR Y LOCALIZAR DACPAC (compartido con PR)
+  # ==============================================================================
+  - template: steps-build-sql.yml
+    parameters:
+      sqlProjectPath: ${{ parameters.sqlProjectPath }}
+      dacpacOutputDirectory: ${{ parameters.dacpacOutputDirectory }}
+      buildConfiguration: ${{ parameters.buildConfiguration }}
+      deploymentFolder: ${{ parameters.deploymentFolder }}
+
+  # ==============================================================================
+  # SECCION 5: GENERAR METADATA
   # ==============================================================================
   - powershell: |
-      $projectPath = Join-Path `
-          "$(System.DefaultWorkingDirectory)" `
-          '${{ parameters.sqlProjectPath }}'
-
-      if (-not (Test-Path $projectPath -PathType Leaf)) {
-          Write-Host "##vso[task.logissue type=error]No se encontró el proyecto SQL: $projectPath"
-          exit 1
-      }
-
-      if ([System.IO.Path]::GetExtension($projectPath) -ne '.sqlproj') {
-          Write-Host "##vso[task.logissue type=error]El archivo indicado no es un .sqlproj: $projectPath"
-          exit 1
-      }
-
-      Write-Host "Proyecto SQL: $projectPath"
-      Write-Host "##vso[task.setvariable variable=ResolvedSqlProjectPath]$projectPath"
-    displayName: 'Validar proyecto SQL'
-
-  # ==============================================================================
-  # SECCION 2: BUILD
-  # ==============================================================================
-  - task: VSBuild@1
-    displayName: 'Compilar proyecto SQL'
-    inputs:
-      solution: '$(ResolvedSqlProjectPath)'
-      # vsVersion: '17.0'
-      # platform: 'Any CPU'
-      configuration: '${{ parameters.buildConfiguration }}'
-      # msbuildArchitecture: 'x64'
-      clean: true
-      # restoreNugetPackages: false
-      msbuildArgs: >
-        /p:OutputPath=${{ parameters.dacpacOutputDirectory }}
-        /p:RunSqlCodeAnalysis=True
-        /p:TreatTSqlWarningsAsErrors=True
-
-  # ==============================================================================
-  # SECCION 3: VALIDAR DACPAC Y GENERAR METADATA
-  # ==============================================================================
-  - powershell: |
-      $projectName = [System.IO.Path]::GetFileNameWithoutExtension('${{ parameters.sqlProjectPath }}')
-
-      $allDacpacs = @(
-          Get-ChildItem `
-              -Path '${{ parameters.dacpacOutputDirectory }}' `
-              -Filter '*.dacpac' `
-              -File `
-              -ErrorAction SilentlyContinue
+      # Variables SQLCMD que declara el proyecto. El stage de paquete solo pasa
+      # /v: para las que existen.
+      [xml]$project = Get-Content -LiteralPath "$(ResolvedSqlProjectPath)" -Raw
+      $sqlCmdVariables = @(
+          $project.SelectNodes("//*[local-name()='SqlCmdVariable']") |
+              ForEach-Object { $_.GetAttribute('Include') } |
+              Where-Object { $_ }
       )
-
-      # El build también copia a la salida los DACPAC referenciados (p. ej. master.dacpac).
-      # Solo se toma el que corresponde al proyecto.
-      $dacpacFiles = @($allDacpacs | Where-Object { $_.BaseName -eq $projectName })
-
-      if ($dacpacFiles.Count -ne 1) {
-          Write-Host "##vso[task.logissue type=error]No se encontró el DACPAC del proyecto ($projectName.dacpac). Archivos .dacpac en la salida: $($allDacpacs.Count)."
-
-          foreach ($file in $allDacpacs) {
-              Write-Host " - $($file.FullName)"
-          }
-
-          exit 1
-      }
-
-      foreach ($file in @($allDacpacs | Where-Object { $_.BaseName -ne $projectName })) {
-          Write-Host "DACPAC referenciado (se publica junto al principal, no se despliega): $($file.Name)"
-      }
-
-      $dacpac = $dacpacFiles[0]
-      $hash = Get-FileHash -Path $dacpac.FullName -Algorithm SHA256
 
       $metadata = [ordered]@{
           artifactName       = '${{ parameters.artifactName }}'
-          dacpacName         = $dacpac.Name
+          dacpacName         = "$(ResolvedDacpacName)"
           sqlProjectPath     = '${{ parameters.sqlProjectPath }}'
           buildId            = "$(Build.BuildId)"
           buildNumber        = "$(Build.BuildNumber)"
           sourceBranch       = "$(Build.SourceBranch)"
           sourceVersion      = "$(Build.SourceVersion)"
           buildConfiguration = '${{ parameters.buildConfiguration }}'
-          sha256             = $hash.Hash
+          sha256             = "$(ResolvedDacpacHash)"
+          sqlCmdVariables    = $sqlCmdVariables
           generatedAtUtc     = [DateTime]::UtcNow.ToString('o')
       }
 
@@ -113,18 +66,17 @@ steps:
           ConvertTo-Json -Depth 5 |
           Set-Content -Path $metadataPath -Encoding UTF8
 
-      Write-Host "DACPAC generado: $($dacpac.FullName)"
-      Write-Host "SHA256: $($hash.Hash)"
-    displayName: 'Validar DACPAC y generar metadata'
+      Get-Content -LiteralPath $metadataPath
+    displayName: 'Generar metadata'
 
   # ==============================================================================
-  # SECCION 4: STEPS ADICIONALES
+  # SECCION 6: STEPS ADICIONALES
   # ==============================================================================
   - ${{ each step in parameters.prePublishSteps }}:
     - ${{ step }}
 
   # ==============================================================================
-  # SECCION 5: PUBLICAR DACPAC
+  # SECCION 7: PUBLICAR DACPAC
   # ==============================================================================
   - publish: '${{ parameters.dacpacOutputDirectory }}'
     artifact: '${{ parameters.artifactName }}-$(Build.BuildNumber)-$(Build.SourceBranchName)'

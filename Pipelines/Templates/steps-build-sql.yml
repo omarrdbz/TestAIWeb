@@ -1,0 +1,112 @@
+# Pasos de build compartidos por el pipeline de CI y el de validación de PR,
+# para que ambos validen y compilen exactamente igual.
+#
+# Variables que deja definidas para los pasos siguientes:
+#   ResolvedSqlProjectPath, ResolvedDacpacPath, ResolvedDacpacName, ResolvedDacpacHash
+parameters:
+  - name: sqlProjectPath
+    type: string
+
+  - name: dacpacOutputDirectory
+    type: string
+    default: '$(Build.ArtifactStagingDirectory)\Dacpac'
+
+  - name: buildConfiguration
+    type: string
+    default: 'Release'
+
+  - name: deploymentFolder
+    type: string
+    default: 'Deployment'
+
+steps:
+  # ==============================================================================
+  # SECCION 1: VALIDACION DEL PROJECT PATH
+  # ==============================================================================
+  - powershell: |
+      $projectPath = Join-Path `
+          "$(System.DefaultWorkingDirectory)" `
+          '${{ parameters.sqlProjectPath }}'
+
+      if (-not (Test-Path $projectPath -PathType Leaf)) {
+          Write-Host "##vso[task.logissue type=error]No se encontró el proyecto SQL: $projectPath"
+          exit 1
+      }
+
+      if ([System.IO.Path]::GetExtension($projectPath) -ne '.sqlproj') {
+          Write-Host "##vso[task.logissue type=error]El archivo indicado no es un .sqlproj: $projectPath"
+          exit 1
+      }
+
+      Write-Host "Proyecto SQL: $projectPath"
+      Write-Host "##vso[task.setvariable variable=ResolvedSqlProjectPath]$projectPath"
+    displayName: 'Validar proyecto SQL'
+
+  # ==============================================================================
+  # SECCION 2: VALIDAR SCRIPTS DE PRE/POST DEPLOYMENT
+  # ==============================================================================
+  - template: steps-validate-deployment-scripts.yml
+    parameters:
+      sqlProjectPath: ${{ parameters.sqlProjectPath }}
+      deploymentFolder: ${{ parameters.deploymentFolder }}
+
+  # ==============================================================================
+  # SECCION 3: BUILD
+  # ==============================================================================
+  - task: VSBuild@1
+    displayName: 'Compilar proyecto SQL'
+    inputs:
+      solution: '$(ResolvedSqlProjectPath)'
+      # vsVersion: '17.0'
+      # platform: 'Any CPU'
+      configuration: '${{ parameters.buildConfiguration }}'
+      # msbuildArchitecture: 'x64'
+      clean: true
+      # restoreNugetPackages: false
+      msbuildArgs: >
+        /p:OutputPath=${{ parameters.dacpacOutputDirectory }}
+        /p:RunSqlCodeAnalysis=True
+        /p:TreatTSqlWarningsAsErrors=True
+
+  # ==============================================================================
+  # SECCION 4: LOCALIZAR DACPAC DEL PROYECTO
+  # ==============================================================================
+  - powershell: |
+      $projectName = [System.IO.Path]::GetFileNameWithoutExtension('${{ parameters.sqlProjectPath }}')
+
+      $allDacpacs = @(
+          Get-ChildItem `
+              -Path '${{ parameters.dacpacOutputDirectory }}' `
+              -Filter '*.dacpac' `
+              -File `
+              -ErrorAction SilentlyContinue
+      )
+
+      # El build también copia a la salida los DACPAC referenciados (p. ej. master.dacpac).
+      # Solo se toma el que corresponde al proyecto.
+      $dacpacFiles = @($allDacpacs | Where-Object { $_.BaseName -eq $projectName })
+
+      if ($dacpacFiles.Count -ne 1) {
+          Write-Host "##vso[task.logissue type=error]No se encontró el DACPAC del proyecto ($projectName.dacpac). Archivos .dacpac en la salida: $($allDacpacs.Count)."
+
+          foreach ($file in $allDacpacs) {
+              Write-Host " - $($file.FullName)"
+          }
+
+          exit 1
+      }
+
+      foreach ($file in @($allDacpacs | Where-Object { $_.BaseName -ne $projectName })) {
+          Write-Host "DACPAC referenciado (se publica junto al principal, no se despliega): $($file.Name)"
+      }
+
+      $dacpac = $dacpacFiles[0]
+      $hash = (Get-FileHash -LiteralPath $dacpac.FullName -Algorithm SHA256).Hash
+
+      Write-Host "DACPAC generado: $($dacpac.FullName)"
+      Write-Host "SHA256: $hash"
+
+      Write-Host "##vso[task.setvariable variable=ResolvedDacpacPath]$($dacpac.FullName)"
+      Write-Host "##vso[task.setvariable variable=ResolvedDacpacName]$($dacpac.Name)"
+      Write-Host "##vso[task.setvariable variable=ResolvedDacpacHash]$hash"
+    displayName: 'Localizar DACPAC'

@@ -15,6 +15,11 @@ parameters:
     type: string
     default: ''
 
+  # Segundos que SqlPackage espera cada consulta contra la base (su default es 60).
+  - name: sqlPackageCommandTimeout
+    type: number
+    default: 60
+
   - name: prePublishSteps
     type: stepList
     default: []
@@ -57,43 +62,9 @@ steps:
   # ==============================================================================
   # SECCION 3: VALIDAR SQLPACKAGE
   # ==============================================================================
-  - powershell: |
-      $sqlPackage = '${{ parameters.sqlPackagePath }}'
-
-      if (-not [string]::IsNullOrWhiteSpace($sqlPackage)) {
-
-          if (-not (Test-Path $sqlPackage)) {
-              Write-Host "##vso[task.logissue type=error]SqlPackage no encontrado en: $sqlPackage"
-              exit 1
-          }
-
-          $resolvedSqlPackage = $sqlPackage
-      }
-      else {
-
-          $candidates = @(
-              "C:\Program Files\Microsoft SQL Server\170\DAC\bin\SqlPackage.exe",
-              "C:\Program Files\Microsoft SQL Server\160\DAC\bin\SqlPackage.exe",
-              "C:\Program Files\Microsoft SQL Server\150\DAC\bin\SqlPackage.exe"
-          )
-
-          $resolvedSqlPackage = $candidates |
-              Where-Object { Test-Path $_ } |
-              Select-Object -First 1
-      }
-
-      if (-not $resolvedSqlPackage) {
-          Write-Host "##vso[task.logissue type=error]No se encontró SqlPackage.exe."
-          exit 1
-      }
-
-      Write-Host "SqlPackage detectado:"
-      Write-Host $resolvedSqlPackage
-
-      Write-Host "##vso[task.setvariable variable=SqlPackagePath]$resolvedSqlPackage"
-
-      & $resolvedSqlPackage /Version
-    displayName: 'Validar SqlPackage'
+  - template: steps-resolve-sqlpackage.yml
+    parameters:
+      sqlPackagePath: ${{ parameters.sqlPackagePath }}
 
   # ==============================================================================
   # SECCION 4: VALIDAR DESTINO
@@ -178,21 +149,25 @@ steps:
       Write-Host "DACPAC encontrado:"
       Write-Host $dacpac.FullName
 
+      # Variables SQLCMD que declara el proyecto (las registra el CI).
+      $declaredVariables = @($buildMetadata.sqlCmdVariables | Where-Object { $_ }) -join ';'
+
       Write-Host "##vso[task.setvariable variable=ResolvedDacpacPath]$($dacpac.FullName)"
       Write-Host "##vso[task.setvariable variable=ResolvedDacpacName]$($dacpac.Name)"
-
+      Write-Host "##vso[task.setvariable variable=ResolvedDacpacHash]$hash"
+      Write-Host "##vso[task.setvariable variable=SourceArtifactRoot]$artifactRoot"
+      Write-Host "##vso[task.setvariable variable=DeclaredSqlCmdVariables]$declaredVariables"
     displayName: 'Localizar DACPAC'
 
   # ==============================================================================
   # SECCION 6: GENERAR SCRIPT Y DEPLOYMENT REPORT
+  #   Las opciones de SqlPackage se guardan en sqlpackage-options.json y el DACPAC
+  #   se incluye en el paquete, para que CD pueda repetir la comparación justo
+  #   antes de ejecutar y confirmar que el script sigue vigente.
   # ==============================================================================
   - powershell: |
       $sqlPackage = "$(SqlPackagePath)"
       $dacpac = "$(ResolvedDacpacPath)"
-
-      # BlockOnPossibleDataLoss queda en True salvo que se haya aceptado el riesgo.
-      $blockOnPossibleDataLoss = if ($env:ALLOW_DATA_LOSS -eq 'True') { 'False' } else { 'True' }
-      Write-Host "BlockOnPossibleDataLoss: $blockOnPossibleDataLoss"
 
       $outputDirectory = "$(Build.ArtifactStagingDirectory)\deployment"
 
@@ -214,26 +189,70 @@ steps:
       $deploymentReport =
           Join-Path $outputDirectory "DeploymentReport.xml"
 
-      # Argumentos adicionales: se separan en un arreglo para que cada /p: llegue
-      # a SqlPackage como argumento independiente (y nada si viene vacío).
-      $additionalArgs = '${{ parameters.additionalSqlPackageArguments }}'
-      $extraArgs = @()
-      if (-not [string]::IsNullOrWhiteSpace($additionalArgs)) {
-          $extraArgs = @($additionalArgs.Trim() -split '\s+(?=/)')
+      $optionsFile =
+          Join-Path $outputDirectory "sqlpackage-options.json"
+
+      # ---------------------------------------------------------------------------
+      # Opciones de SqlPackage (las mismas para el reporte, el script y CD)
+      # ---------------------------------------------------------------------------
+
+      # BlockOnPossibleDataLoss queda en True salvo que se haya aceptado el riesgo.
+      $blockOnPossibleDataLoss = if ($env:ALLOW_DATA_LOSS -eq 'True') { 'False' } else { 'True' }
+      Write-Host "BlockOnPossibleDataLoss: $blockOnPossibleDataLoss"
+
+      $options = New-Object System.Collections.Generic.List[string]
+      $options.Add("/p:BlockOnPossibleDataLoss=$blockOnPossibleDataLoss")
+      $options.Add('/p:VerifyDeployment=True')
+      $options.Add('/p:CreateNewDatabase=False')
+      $options.Add('/p:ScriptDatabaseOptions=False')
+      $options.Add("/p:CommandTimeout=$env:SQLPACKAGE_COMMAND_TIMEOUT")
+
+      # Variables SQLCMD de trazabilidad para deploy.ScriptHistory.
+      # Solo se pasan las que declara el proyecto.
+      $declaredVariables = @("$(DeclaredSqlCmdVariables)".Split(';') | Where-Object { $_ -and $_ -notmatch '^\$\(' })
+
+      $sqlCmdValues = [ordered]@{
+          BuildNumber  = $env:BUILD_NUMBER
+          RequestedFor = $env:REQUESTED_FOR
       }
 
+      foreach ($name in $sqlCmdValues.Keys) {
+          if ($declaredVariables -contains $name) {
+              # Se usa dentro de N'...' en SQL (comilla simple doble) y dentro de
+              # :setvar "..." (sin comillas dobles).
+              $value = "$($sqlCmdValues[$name])".Replace("'", "''").Replace('"', '')
+              $options.Add("/v:$name=$value")
+          }
+          else {
+              Write-Host "##vso[task.logissue type=warning]El proyecto no declara la variable SQLCMD $name; no se registrará en deploy.ScriptHistory."
+          }
+      }
+
+      # Argumentos adicionales: cada /p: llega a SqlPackage como argumento independiente.
+      $additionalArgs = '${{ parameters.additionalSqlPackageArguments }}'
+      if (-not [string]::IsNullOrWhiteSpace($additionalArgs)) {
+          $options.AddRange([string[]]($additionalArgs.Trim() -split '\s+(?=/)'))
+      }
+
+      $optionArgs = $options.ToArray()
+
+      ConvertTo-Json -InputObject $optionArgs |
+          Set-Content -LiteralPath $optionsFile -Encoding UTF8
+
+      Write-Host 'Opciones de SqlPackage:'
+      $optionArgs | ForEach-Object { Write-Host "  $_" }
+
+      # ---------------------------------------------------------------------------
+      # Deployment report
+      # ---------------------------------------------------------------------------
       Write-Host "Generando deployment report..."
 
       & $sqlPackage `
           /Action:DeployReport `
-          /SourceFile:"$dacpac" `
-          /TargetConnectionString:"$(ConnectionString)" `
-          /OutputPath:"$deploymentReport" `
-          "/p:BlockOnPossibleDataLoss=$blockOnPossibleDataLoss" `
-          /p:VerifyDeployment=True `
-          /p:CreateNewDatabase=False `
-          /p:ScriptDatabaseOptions=False `
-          @extraArgs
+          "/SourceFile:$dacpac" `
+          "/TargetConnectionString:$env:TARGET_CONNECTION_STRING" `
+          "/OutputPath:$deploymentReport" `
+          @optionArgs
 
       if ($LASTEXITCODE -ne 0) {
           Write-Host "##vso[task.logissue type=error]Falló generación del deployment report."
@@ -260,23 +279,35 @@ steps:
 
       Write-Host "##vso[task.setvariable variable=DataLossAlerts]$dataLossAlerts"
 
+      # ---------------------------------------------------------------------------
+      # Deployment script
+      # ---------------------------------------------------------------------------
       Write-Host "Generando deployment script..."
 
       & $sqlPackage `
           /Action:Script `
-          /SourceFile:"$dacpac" `
-          /TargetConnectionString:"$(ConnectionString)" `
-          /OutputPath:"$deploymentScript" `
-          "/p:BlockOnPossibleDataLoss=$blockOnPossibleDataLoss" `
-          /p:VerifyDeployment=True `
-          /p:CreateNewDatabase=False `
-          /p:ScriptDatabaseOptions=False `
-          @extraArgs
+          "/SourceFile:$dacpac" `
+          "/TargetConnectionString:$env:TARGET_CONNECTION_STRING" `
+          "/OutputPath:$deploymentScript" `
+          @optionArgs
 
       if ($LASTEXITCODE -ne 0) {
           Write-Host "##vso[task.logissue type=error]Falló generación del deployment script."
           exit 1
       }
+
+      # ---------------------------------------------------------------------------
+      # DACPAC al paquete (con sus referencias) para la verificación en CD
+      # ---------------------------------------------------------------------------
+      $dacpacDirectory = Join-Path $outputDirectory 'dacpac'
+
+      New-Item `
+          -Path $dacpacDirectory `
+          -ItemType Directory `
+          -Force | Out-Null
+
+      Get-ChildItem -LiteralPath "$(SourceArtifactRoot)" -Filter '*.dacpac' -File |
+          Copy-Item -Destination $dacpacDirectory
 
       Write-Host "Script generado:"
       Write-Host $deploymentScript
@@ -286,9 +317,14 @@ steps:
 
       Write-Host "##vso[task.setvariable variable=DeploymentScriptPath]$deploymentScript"
       Write-Host "##vso[task.setvariable variable=DeploymentReportPath]$deploymentReport"
+      Write-Host "##vso[task.setvariable variable=DeploymentOptionsPath]$optionsFile"
     displayName: 'Generar Script SQL y Deployment Report'
     env:
       ALLOW_DATA_LOSS: ${{ parameters.allowDataLoss }}
+      SQLPACKAGE_COMMAND_TIMEOUT: ${{ parameters.sqlPackageCommandTimeout }}
+      TARGET_CONNECTION_STRING: $(ConnectionString)
+      BUILD_NUMBER: $(Build.BuildNumber)
+      REQUESTED_FOR: $(Build.RequestedFor)
 
   # ==============================================================================
   # SECCION 7: GENERAR METADATA
@@ -317,6 +353,7 @@ steps:
           requestedFor          = "$(Build.RequestedFor)"
 
           dacpacName            = "$(ResolvedDacpacName)"
+          dacpacHash            = "$(ResolvedDacpacHash)"
 
           deploymentScriptHash  = $scriptHash
           deploymentReportHash  = $reportHash
@@ -324,6 +361,8 @@ steps:
           allowDataLoss         = ($env:ALLOW_DATA_LOSS -eq 'True')
           dataLossJustification = "$env:DATA_LOSS_JUSTIFICATION".Trim()
           dataLossAlerts        = [int]'$(DataLossAlerts)'
+
+          sqlPackageOptions     = (Get-Content -LiteralPath "$(DeploymentOptionsPath)" -Raw | ConvertFrom-Json)
 
           generatedAtUtc        = [DateTime]::UtcNow.ToString("o")
       }

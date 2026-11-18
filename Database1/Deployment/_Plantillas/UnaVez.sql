@@ -44,8 +44,9 @@ BEGIN
 
         -- ====================================================================
 
-        INSERT INTO deploy.ScriptHistory (ScriptId, Phase)
-        VALUES (@ScriptId, @Phase);
+        -- $(BuildNumber) y $(RequestedFor) los pone el pipeline (variables SQLCMD).
+        INSERT INTO deploy.ScriptHistory (ScriptId, Phase, BuildNumber, RequestedFor)
+        VALUES (@ScriptId, @Phase, N'$(BuildNumber)', N'$(RequestedFor)');
 
         COMMIT TRANSACTION;
 

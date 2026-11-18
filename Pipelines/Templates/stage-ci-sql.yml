@@ -18,9 +18,17 @@ parameters:
     type: string
     default: 'Release'
 
+  - name: deploymentFolder
+    type: string
+    default: 'Deployment'
+
   - name: prePublishSteps
     type: stepList
     default: []
+
+  - name: timeoutInMinutes
+    type: number
+    default: 60
 
 stages:
   - stage: CI_SQL_PROJECT
@@ -30,6 +38,7 @@ stages:
     jobs:
       - job: CI_SQL_PROJECT
         displayName: 'Build DACPAC package'
+        timeoutInMinutes: ${{ parameters.timeoutInMinutes }}
         steps:
           - template: steps-ci-sql.yml
             parameters:
@@ -37,4 +46,5 @@ stages:
               sqlProjectPath: ${{ parameters.sqlProjectPath }}
               dacpacOutputDirectory: ${{ parameters.dacpacOutputDirectory }}
               buildConfiguration: ${{ parameters.buildConfiguration }}
+              deploymentFolder: ${{ parameters.deploymentFolder }}
               prePublishSteps: ${{ parameters.prePublishSteps }}

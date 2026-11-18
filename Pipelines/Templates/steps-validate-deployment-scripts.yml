@@ -1,0 +1,237 @@
+parameters:
+  - name: sqlProjectPath
+    type: string
+
+  # Carpeta de los scripts de pre/post deployment, relativa al .sqlproj.
+  - name: deploymentFolder
+    type: string
+    default: 'Deployment'
+
+  # Variables SQLCMD que el .sqlproj debe declarar (las usa deploy.ScriptHistory).
+  - name: requiredSqlCmdVariables
+    type: object
+    default:
+      - BuildNumber
+      - RequestedFor
+
+steps:
+  # ==============================================================================
+  # VALIDAR SCRIPTS DE PRE/POST DEPLOYMENT
+  #   Revisa lo que hoy depende de la revisión manual del PR:
+  #   - .sqlproj: PreDeploy/PostDeploy correctos, scripts como None, variables SQLCMD.
+  #   - Cada :r apunta a un archivo que existe y no se repite.
+  #   - Cada script de Pre/Post está incluido con :r desde la fase correcta.
+  #   - Scripts de una vez: nombre, @ScriptId = nombre del archivo, @Phase, sin repetir.
+  #   - Todos los scripts terminan con GO.
+  # ==============================================================================
+  - powershell: |
+      $ErrorActionPreference = 'Stop'
+
+      $projectPath = [System.IO.Path]::GetFullPath(
+          (Join-Path "$(System.DefaultWorkingDirectory)" '${{ parameters.sqlProjectPath }}'))
+      $projectDir = Split-Path -Parent $projectPath
+      $deploymentFolder = '${{ parameters.deploymentFolder }}'.Trim('\', '/')
+      $deploymentDir = Join-Path $projectDir $deploymentFolder
+      $requiredVariables = @('${{ join(';', parameters.requiredSqlCmdVariables) }}'.Split(';') | Where-Object { $_ })
+
+      $errors = New-Object System.Collections.Generic.List[string]
+      $warnings = New-Object System.Collections.Generic.List[string]
+
+      if (-not (Test-Path -LiteralPath $deploymentDir -PathType Container)) {
+          Write-Host "El proyecto no tiene la carpeta '$deploymentFolder'; no hay scripts de pre/post que validar."
+          exit 0
+      }
+
+      # ---------------------------------------------------------------------------
+      # 1. Configuración del .sqlproj
+      # ---------------------------------------------------------------------------
+      [xml]$project = Get-Content -LiteralPath $projectPath -Raw
+      $isSdkProject = -not [string]::IsNullOrEmpty($project.DocumentElement.GetAttribute('Sdk'))
+      $prefix = $deploymentFolder + '\'
+
+      function Get-ProjectItems([string]$ItemType, [string]$Attribute = 'Include') {
+          @($project.SelectNodes("//*[local-name()='$ItemType']") |
+              ForEach-Object { $_.GetAttribute($Attribute) } |
+              Where-Object { $_ } |
+              ForEach-Object { $_.Replace('/', '\') })
+      }
+
+      $expected = @{
+          PreDeploy  = $prefix + 'Script.PreDeployment.sql'
+          PostDeploy = $prefix + 'Script.PostDeployment.sql'
+      }
+
+      foreach ($itemType in $expected.Keys) {
+          $items = Get-ProjectItems $itemType
+          if ($items.Count -ne 1 -or $items[0] -ne $expected[$itemType]) {
+              $errors.Add("El .sqlproj debe tener exactamente un <$itemType Include=""$($expected[$itemType])"" />. Encontrado: $($items -join ', ')")
+          }
+      }
+
+      foreach ($item in (Get-ProjectItems 'Build' | Where-Object { $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })) {
+          $errors.Add("$item tiene Build Action = Build; los scripts de $deploymentFolder deben ser None.")
+      }
+
+      if ($isSdkProject) {
+          $removed = Get-ProjectItems 'Build' 'Remove'
+          if (-not ($removed | Where-Object { $_ -ieq ($prefix + '**') -or $_ -ieq ($prefix + '**\*.sql') })) {
+              $errors.Add("Proyecto SDK: falta <Build Remove=""$prefix**"" /> para que los scripts no se compilen como esquema.")
+          }
+      }
+
+      $declaredVariables = Get-ProjectItems 'SqlCmdVariable'
+      foreach ($variable in $requiredVariables) {
+          if ($declaredVariables -notcontains $variable) {
+              $errors.Add("El .sqlproj no declara la variable SQLCMD '$variable' (ver Deployment\README.md).")
+          }
+      }
+
+      # ---------------------------------------------------------------------------
+      # 2. Líneas :r de los scripts principales
+      # ---------------------------------------------------------------------------
+      $mainScripts = [ordered]@{
+          PRE  = Join-Path $deploymentDir 'Script.PreDeployment.sql'
+          POST = Join-Path $deploymentDir 'Script.PostDeployment.sql'
+      }
+
+      $included = @{}        # ruta completa en minúsculas -> fase
+      $includeOrder = @{ PRE = New-Object System.Collections.Generic.List[string]; POST = New-Object System.Collections.Generic.List[string] }
+
+      foreach ($phase in $mainScripts.Keys) {
+          $mainScript = $mainScripts[$phase]
+
+          if (-not (Test-Path -LiteralPath $mainScript -PathType Leaf)) {
+              $errors.Add("No existe $mainScript.")
+              continue
+          }
+
+          $mainDir = Split-Path -Parent $mainScript
+          $lineNumber = 0
+
+          foreach ($line in Get-Content -LiteralPath $mainScript) {
+              $lineNumber++
+              $match = [regex]::Match($line, '^\s*:r\s+(.+?)\s*$')
+              if (-not $match.Success) { continue }
+
+              $relative = $match.Groups[1].Value.Trim('"')
+              $fullPath = [System.IO.Path]::GetFullPath((Join-Path $mainDir $relative))
+              $key = $fullPath.ToLowerInvariant()
+              $where = "$(Split-Path -Leaf $mainScript), línea $lineNumber"
+
+              if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+                  $errors.Add("${where}: el archivo '$relative' no existe.")
+                  continue
+              }
+
+              if ($included.ContainsKey($key)) {
+                  $errors.Add("${where}: '$relative' ya está incluido; cada script se incluye una sola vez.")
+                  continue
+              }
+
+              $included[$key] = $phase
+              $includeOrder[$phase].Add($fullPath)
+          }
+      }
+
+      $infraScript = [System.IO.Path]::GetFullPath((Join-Path $deploymentDir 'Infra\ScriptHistory.sql'))
+      if ($includeOrder.PRE.Count -eq 0 -or $includeOrder.PRE[0] -ne $infraScript) {
+          $errors.Add('El primer :r de Script.PreDeployment.sql debe ser .\Infra\ScriptHistory.sql (crea la tabla de control).')
+      }
+
+      # ---------------------------------------------------------------------------
+      # 3. Scripts de las carpetas Pre/Post
+      # ---------------------------------------------------------------------------
+      $scriptFolders = @(
+          @{ Path = 'Pre\UnaVez';       Phase = 'PRE';  OneTime = $true },
+          @{ Path = 'Post\UnaVez';      Phase = 'POST'; OneTime = $true },
+          @{ Path = 'Post\Recurrentes'; Phase = 'POST'; OneTime = $false }
+      )
+
+      $scriptIds = @{}
+      $checked = 0
+
+      foreach ($folder in $scriptFolders) {
+          $folderPath = Join-Path $deploymentDir $folder.Path
+          if (-not (Test-Path -LiteralPath $folderPath -PathType Container)) { continue }
+
+          foreach ($file in Get-ChildItem -LiteralPath $folderPath -Filter '*.sql' -File -Recurse) {
+              $checked++
+              $relative = $file.FullName.Substring($deploymentDir.Length).TrimStart('\')
+              $key = $file.FullName.ToLowerInvariant()
+
+              if (-not $included.ContainsKey($key)) {
+                  $errors.Add("$relative no está incluido con :r en Script.$(if ($folder.Phase -eq 'PRE') { 'PreDeployment' } else { 'PostDeployment' }).sql; no se ejecutaría.")
+              }
+              elseif ($included[$key] -ne $folder.Phase) {
+                  $errors.Add("$relative está en una carpeta $($folder.Phase) pero se incluye desde el script $($included[$key]).")
+              }
+
+              # [string] para que un archivo vacío sea '' y no $null.
+              $content = [string](Get-Content -LiteralPath $file.FullName -Raw)
+              $lastLine = @($content -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -Last 1
+
+              if (-not $lastLine -or $lastLine.Trim() -ne 'GO') {
+                  $errors.Add("$relative debe terminar con GO.")
+              }
+
+              if (-not $folder.OneTime) { continue }
+
+              if ($file.Name -notmatch '^\d{4}-\d{2}-\d{2}_\d{3}_[A-Za-z0-9_]+\.sql$') {
+                  $errors.Add("$relative no sigue el formato AAAA-MM-DD_NNN_descripcion.sql (solo letras, números y _).")
+              }
+
+              $id = $file.BaseName
+              if ($scriptIds.ContainsKey($id)) {
+                  $errors.Add("$relative repite el Id '$id' de $($scriptIds[$id]).")
+              }
+              else {
+                  $scriptIds[$id] = $relative
+              }
+
+              $idMatch = [regex]::Match($content, "@ScriptId\s+nvarchar\s*\(\s*\d+\s*\)\s*=\s*N'([^']*)'", 'IgnoreCase')
+              if (-not $idMatch.Success) {
+                  $errors.Add("$relative no declara @ScriptId como en la plantilla.")
+              }
+              elseif ($idMatch.Groups[1].Value -cne $id) {
+                  $errors.Add("$relative tiene @ScriptId = '$($idMatch.Groups[1].Value)', pero debe ser '$id' (el nombre del archivo).")
+              }
+
+              $phaseMatch = [regex]::Match($content, "@Phase\s+varchar\s*\(\s*\d+\s*\)\s*=\s*'([^']*)'", 'IgnoreCase')
+              if (-not $phaseMatch.Success) {
+                  $errors.Add("$relative no declara @Phase como en la plantilla.")
+              }
+              elseif ($phaseMatch.Groups[1].Value -ne $folder.Phase) {
+                  $errors.Add("$relative tiene @Phase = '$($phaseMatch.Groups[1].Value)', pero está en una carpeta $($folder.Phase).")
+              }
+          }
+      }
+
+      # Los scripts de una vez deberían incluirse en orden de nombre (fecha + consecutivo).
+      foreach ($phase in $includeOrder.Keys) {
+          $oneTime = @($includeOrder[$phase] | Where-Object { $_ -match '\\UnaVez\\' } | ForEach-Object { Split-Path -Leaf $_ })
+          $sorted = @($oneTime | Sort-Object)
+          if (($oneTime -join '|') -ne ($sorted -join '|')) {
+              $warnings.Add("Los scripts de una vez de $phase no están incluidos en orden de nombre; revisa que el orden sea el correcto.")
+          }
+      }
+
+      # ---------------------------------------------------------------------------
+      # Resultado
+      # ---------------------------------------------------------------------------
+      foreach ($warning in $warnings) {
+          Write-Host "##vso[task.logissue type=warning]$warning"
+      }
+
+      foreach ($message in $errors) {
+          Write-Host "##vso[task.logissue type=error]$message"
+      }
+
+      Write-Host "Scripts incluidos: PRE=$($includeOrder.PRE.Count), POST=$($includeOrder.POST.Count). Scripts revisados: $checked."
+
+      if ($errors.Count -gt 0) {
+          Write-Host "Se encontraron $($errors.Count) problema(s) en los scripts de pre/post deployment."
+          exit 1
+      }
+
+      Write-Host 'Scripts de pre/post deployment válidos.'
+    displayName: 'Validar scripts de pre/post deployment'

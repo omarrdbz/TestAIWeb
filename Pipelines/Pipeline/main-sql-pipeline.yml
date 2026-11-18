@@ -47,6 +47,10 @@ stages:
       pool: 'Pool-QA'
       variableGroupCD: 'vg-cicdpipelinetest-cd-sql-staging'
       sqlcmdPath: 'C:\Tools\sqlcmd\sqlcmd.exe'
+      sqlPackagePath: 'C:\Tools\SqlPackage\SqlPackage.exe'
+      # Respaldo COPY_ONLY antes de ejecutar. Requiere la variable BackupDirectory
+      # en el variable group (ruta vista desde el servidor SQL).
+      backupBeforeDeploy: true
       allowDataLoss: ${{ parameters.allowDataLoss }}
       dataLossJustification: ${{ parameters.dataLossJustification }}
       # Opcional: environment con aprobadores distintos para despliegues con pérdida de datos.
